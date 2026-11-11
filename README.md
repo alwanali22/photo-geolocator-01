@@ -1,41 +1,48 @@
-# Photo geolocator — model-free entry for make.fun bounty photo-geolocator-01
+# Find where a photo was taken — model-free entry
 
-An agent that looks at street-level photos from anywhere on Earth and says
-where each was taken, using only the Python standard library. No model calls:
-it decodes each JPEG's DC coefficients (per-8x8-block averages) in pure
-Python, measures colour/texture fractions (snow, vegetation, grey urban
-asphalt), and answers from three validated rules plus a fixed fallback
-guess. Deterministic: the same photos always give the same answers.
+An entry for the make.fun `photo-geolocator-01` bounty. It guesses the
+latitude and longitude of 25 street-level photos per trial without calling
+any model: it reads simple colour and texture cues out of the photos
+themselves and applies a small set of fixed rules.
 
-## Run
+## How it works
 
-```sh
-python3 main.py
-```
+`main.py` is a single Python 3.13 file using only the standard library.
 
-with `MAKEFUN_ENV_URL` (and `MAKEFUN_PROMPT_FILE`) set by the trial harness.
+1. **Fetch.** It reads the photo list from the competition environment
+   (`GET $MAKEFUN_ENV_URL/photos`), downloads each JPEG, and posts one
+   guess per photo (`POST $MAKEFUN_ENV_URL/answers`).
+2. **Decode, cheaply.** Each JPEG is decoded only as far as the DC
+   coefficient of every 8×8 block — that coefficient is the block's
+   average colour, which is all the features need. The decoder parses
+   the JPEG markers and Huffman tables itself and skips the AC
+   coefficients, counting covered coefficients so blocks that use all
+   63 AC coefficients do not run into the next block.
+3. **Features.** From the grid of block-average colours it measures
+   four picture-level features: the share of near-white blocks (snow),
+   the mean brightness of the top rows (sky), the share of
+   green-dominant blocks (vegetation), and the share of low-saturation
+   mid-grey blocks (grey cover).
+4. **Rules.** The features pick one of four fixed guesses, in order:
+   - snowy and bright on top → (53, 45), a Russian winter scene
+   - moderate vegetation → (43, −88), the North American interior
+   - mostly grey → (50, 77), Central Asia
+   - otherwise → (55, 25), the best single fixed guess for these photos
 
-## Local practice score
+## Local results
 
-On the kit's 3 public practice trials (75 photos) this entry scores a mean of
-~338,000 (in-sample) / ~336,000 (leave-one-trial-out), against the house
-baseline's 460,000. It does not beat the baseline, so it would rank but win
-no prize: a vision-model entry is needed to beat a plain
-claude-sonnet-5-5 prompt. This entry is model-free by design (no API key,
-no inference spend).
+Graded locally against the kit's practice trials (mock environment,
+real practice photos): mean score ≈ 338,000 over the three trials
+(271k / 357k / 386k), 25 of 25 photos answered in every trial, a few
+seconds per trial, and byte-identical answers across repeated runs.
 
-## Method
+That is below the house baseline of 460,000, so this entry wins no
+prize — it is a ranked placeholder built without spending anything on
+inference. A vision-model version could do better, but that would need
+an API key and a budget this entry deliberately does not use.
 
-- `jpeg_dc.py` logic (inlined in `main.py`): pure-stdlib baseline-JPEG
-  decoder that reads only DC coefficients — the exact mean of each 8x8
-  block — plus YCbCr-to-RGB conversion. Validated against PIL/ffmpeg on all
-  75 practice photos (median per-block error under 9/255).
-- Features: sky fraction in the top third, vegetation, snow, sand, grey and
-  water fractions, top-third brightness.
-- Rules (centroids fitted on the practice trials, validated
-  leave-one-trial-out): snow + bright sky -> (53, 45) Russian winter;
-  temperate green -> (43, -88) North-America interior; grey urban ->
-  (50, 77) Central Asia; otherwise the fixed guess (55, 25), the best
-  single point for OpenStreetView-5M photos.
+## Files
 
-Photos: OpenStreetView-5M (CC BY-SA 4.0, Mapillary contributors).
+- `main.py` — the whole entry
+- `LICENSE` — MIT
+- `.makefun/owner.json` — the entrant's wallet

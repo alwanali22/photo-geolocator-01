@@ -1,441 +1,495 @@
-"""Pure-stdlib JPEG DC-only decoder.
+"""Photo geolocator entry (model-free).
 
-Decodes only the DC coefficient of each 8x8 block (the block average), which is
-enough for colour/texture statistics and is ~50x faster than a full IDCT in
-pure Python. Handles baseline DCT JPEGs (SOF0), 1-3 components, 4:4:4 / 4:2:2 /
-4:2:0 subsampling, restart markers and byte stuffing. Progressive JPEGs
-(SOF2) raise ValueError.
+Reads 25 street-level photos from the competition environment, estimates
+where each one was taken from simple colour and texture cues, and posts one
+latitude/longitude guess per photo. Pure Python standard library, no model
+calls, no network access except to the environment itself.
+
+Method in brief: each JPEG is decoded only as far as the DC coefficient of
+every 8x8 block, which is the block's average colour. From that coarse grid
+we measure four picture-level features (snow cover, sky brightness, green
+cover, grey cover) and apply a small fixed rule set. The rules were picked
+by checking them against the practice trials and keeping only the ones that
+helped out of sample.
 """
-import struct
+
+import json
+import os
+import urllib.request
+
+# Fixed guesses used by the rule set (latitude, longitude).
+GUESS_RUSSIAN_WINTER = (53.0, 45.0)
+GUESS_NORTH_AMERICA = (43.0, -88.0)
+GUESS_CENTRAL_ASIA = (50.0, 77.0)
+GUESS_FALLBACK = (55.0, 25.0)
 
 
 class BitReader:
-    def __init__(self, data, start):
+    """Reads bits from a cleaned JPEG entropy stream.
+
+    The stream is cleaned before reading: stuffed 0x00 bytes after 0xFF are
+    removed, and restart markers are recorded as byte positions so the
+    decoder can jump to them and drop any padding bits.
+    """
+
+    def __init__(self, data, restarts):
         self.data = data
-        self.pos = start
-        self.acc = 0
+        self.pos = 0
+        self.buf = 0
         self.nbits = 0
+        self.restarts = list(restarts)
+        self.next_restart = 0
 
     def _fill(self):
-        while self.nbits <= 24:
-            if self.pos >= len(self.data):
-                self.acc = (self.acc << 8) | 0xFF
-                self.nbits += 8
-                continue
-            b = self.data[self.pos]
+        # Top the buffer up with up to 4 bytes at a time. Reading a few
+        # bytes past a restart marker is harmless: the bits are only
+        # consumed while decoding, and align_restart discards the buffer
+        # and rewinds the position to the marker before any of them are used.
+        count = min(4, len(self.data) - self.pos)
+        for _ in range(count):
+            self.buf = (self.buf << 8) | self.data[self.pos]
             self.pos += 1
-            if b == 0xFF:
-                # byte stuffing or marker
-                if self.pos < len(self.data):
-                    nb = self.data[self.pos]
-                    if nb == 0x00:
-                        self.pos += 1
-                    elif 0xD0 <= nb <= 0xD7:
-                        # restart marker: realign to byte boundary
-                        self.pos += 1
-                        self.nbits = 0
-                        self.acc = 0
-                        return
-                    else:
-                        # other marker: stop feeding
-                        self.pos -= 1
-                        self.acc = (self.acc << 8) | 0xFF
-                        self.nbits += 8
-                        continue
-                else:
-                    self.acc = (self.acc << 8) | 0xFF
-                    self.nbits += 8
-                    continue
-            self.acc = (self.acc << 8) | b
-            self.nbits += 8
+        self.nbits += 8 * count
+        if self.nbits:
+            self.buf &= (1 << self.nbits) - 1
 
-    def bits(self, n):
-        if n == 0:
-            return 0
-        self._fill()
-        while self.nbits < n:
+    def bit(self):
+        if self.nbits == 0:
             self._fill()
-        self.nbits -= n
-        v = (self.acc >> self.nbits) & ((1 << n) - 1)
-        self.acc &= (1 << self.nbits) - 1
-        return v
+        self.nbits -= 1
+        return (self.buf >> self.nbits) & 1
 
-    def align(self):
+    def bits(self, count):
+        if count == 0:
+            return 0
+        while self.nbits < count and self.pos < len(self.data):
+            self._fill()
+        if self.nbits >= count:
+            self.nbits -= count
+            value = (self.buf >> self.nbits) & ((1 << count) - 1)
+            self.buf &= (1 << self.nbits) - 1 if self.nbits else 0
+            return value
+        # Ran out of data: pad the missing low bits with zeros.
+        value = (self.buf << (count - self.nbits)) & ((1 << count) - 1)
+        self.buf = 0
         self.nbits = 0
-        self.acc = 0
+        return value
+
+    def align_restart(self):
+        """Drop buffered padding bits and jump to the next restart marker."""
+        self.buf = 0
+        self.nbits = 0
+        if self.next_restart < len(self.restarts):
+            self.pos = self.restarts[self.next_restart]
+            self.next_restart += 1
 
 
-class HuffmanTable:
-    def __init__(self, counts, symbols):
-        self.map = {}
-        code = 0
-        k = 0
-        for length in range(1, 17):
-            for _ in range(counts[length - 1]):
-                self.map[(code, length)] = symbols[k]
-                k += 1
-                code += 1
-            code <<= 1
+def build_huffman(counts, symbols):
+    """Build Huffman lookup structures from JPEG DHT data.
 
-    def decode(self, br):
-        code = 0
-        for length in range(1, 17):
-            code = (code << 1) | br.bits(1)
-            sym = self.map.get((code, length))
-            if sym is not None:
-                return sym
-        raise ValueError("bad huffman code")
+    Returns (table, lut): `table` maps (code, length) to a symbol for the
+    slow path, and `lut` maps every 8-bit prefix to (symbol, length) for
+    codes of 8 bits or fewer, which covers nearly every code in practice.
+    """
+    table = {}
+    lut = [None] * 256
+    code = 0
+    index = 0
+    for length in range(1, 17):
+        for _ in range(counts[length - 1]):
+            symbol = symbols[index]
+            table[(code, length)] = symbol
+            if length <= 8:
+                prefix = code << (8 - length)
+                step = 1 << (8 - length)
+                entry = (symbol, length)
+                for peek in range(prefix, prefix + step):
+                    lut[peek] = entry
+            index += 1
+            code += 1
+        code <<= 1
+    return table, lut
 
 
-def _extend(v, size):
+def huffman_decode(reader, table, lut):
+    """Decode one symbol, using the 8-bit prefix table when possible."""
+    if reader.nbits < 8:
+        reader._fill()
+    if reader.nbits >= 8:
+        hit = lut[(reader.buf >> (reader.nbits - 8)) & 0xFF]
+        if hit is not None:
+            symbol, length = hit
+            reader.nbits -= length
+            reader.buf &= (1 << reader.nbits) - 1 if reader.nbits else 0
+            return symbol
+    # Slow path: codes longer than 8 bits, one bit at a time.
+    code = 0
+    for length in range(1, 17):
+        code = (code << 1) | reader.bit()
+        symbol = table.get((code, length))
+        if symbol is not None:
+            return symbol
+    raise ValueError("bad huffman code in entropy data")
+
+
+def extend_value(bits, size):
+    """Undo JPEG's magnitude coding for a coefficient of `size` bits."""
     if size == 0:
         return 0
-    if v < (1 << (size - 1)):
-        return v - (1 << size) + 1
-    return v
+    if bits < (1 << (size - 1)):
+        return bits - ((1 << size) - 1)
+    return bits
 
 
-def decode_dc_grid(data):
-    """Return (width, height, blocks_w, blocks_h, y_grid, cb_grid, cr_grid).
+def parse_segments(data):
+    """Walk the JPEG markers and collect tables, frame info and scan start.
 
-    Grids are per-8x8-block average values (0..255) at luma-block resolution;
-    chroma grids are upsampled by nearest neighbour to the luma grid.
-    y_grid is a list of rows of floats; cb/cr the same, or None for grayscale.
+    Returns (info, entropy_offset) where info holds the image size, the
+    per-component sampling and quant tables, the Huffman tables, the
+    restart interval and the scan's per-component table choices.
     """
-    pos = 0
-    if data[0:2] != b"\xff\xd8":
-        raise ValueError("not a JPEG")
-    pos = 2
-    qtab = {}
-    huff_dc = {}
-    huff_ac = {}
-    width = height = 0
-    comps = []  # (id, h, v, tq)
-    restart_interval = 0
-    while pos < len(data):
-        if data[pos] != 0xFF:
-            raise ValueError("bad marker at %d" % pos)
-        marker = data[pos + 1]
-        pos += 2
-        if marker == 0xD9:
-            break
-        if marker == 0xDA:  # SOS
-            length = struct.unpack(">H", data[pos:pos + 2])[0]
-            ncomp = data[pos + 2]
-            scan_comps = []
-            for i in range(ncomp):
-                cid = data[pos + 3 + 2 * i]
-                tdta = data[pos + 4 + 2 * i]
-                scan_comps.append((cid, tdta >> 4, tdta & 0xF))
-            pos += length
-            return _decode_scan(data, pos, comps, scan_comps, qtab, huff_dc,
-                                huff_ac, width, height, restart_interval)
-        if marker in (0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7):
-            continue
-        length = struct.unpack(">H", data[pos:pos + 2])[0]
-        seg = data[pos + 2:pos + length]
-        if marker == 0xDB:  # DQT
-            p = 0
-            while p < len(seg):
-                pq = seg[p] >> 4
-                tq = seg[p] & 0xF
-                p += 1
-                n = 64 * (2 if pq else 1)
-                vals = list(struct.unpack(">" + ("H" * 64 if pq else "B" * 64),
-                                          seg[p:p + n]))
-                p += n
-                # zigzag -> natural order
-                zz = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5,
-                      12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14,
-                      21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23,
-                      30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60,
-                      61, 54, 47, 55, 62, 63]
-                qtab[tq] = [vals[zz[i]] for i in range(64)]
-        elif marker == 0xC0:  # SOF0
-            prec = seg[0]
-            height = struct.unpack(">H", seg[1:3])[0]
-            width = struct.unpack(">H", seg[3:5])[0]
-            ncomp = seg[5]
-            comps = []
-            for i in range(ncomp):
-                cid = seg[6 + 3 * i]
-                hv = seg[7 + 3 * i]
-                tq = seg[8 + 3 * i]
-                comps.append((cid, hv >> 4, hv & 0xF, tq))
-            if prec != 8:
-                raise ValueError("unsupported precision %d" % prec)
-        elif marker == 0xC2:
-            raise ValueError("progressive JPEG not supported")
-        elif marker == 0xC4:  # DHT
-            p = 0
-            while p < len(seg):
-                tc = seg[p] >> 4
-                th = seg[p] & 0xF
-                p += 1
-                counts = list(seg[p:p + 16])
-                p += 16
-                total = sum(counts)
-                symbols = list(seg[p:p + total])
-                p += total
-                tab = HuffmanTable(counts, symbols)
-                if tc == 0:
-                    huff_dc[th] = tab
-                else:
-                    huff_ac[th] = tab
-        elif marker == 0xDD:  # DRI
-            restart_interval = struct.unpack(">H", seg[0:2])[0]
-        pos += length
-    raise ValueError("no scan found")
-
-
-def _decode_scan(data, start, comps, scan_comps, qtab, huff_dc, huff_ac,
-                 width, height, restart_interval):
-    max_h = max(c[1] for c in comps)
-    max_v = max(c[2] for c in comps)
-    mcu_w = max_h * 8
-    mcu_h = max_v * 8
-    mcus_x = (width + mcu_w - 1) // mcu_w
-    mcus_y = (height + mcu_h - 1) // mcu_h
-    # per-component DC grids at component-block resolution
-    grids = {}
-    for cid, h, v, tq in comps:
-        bw = (width * h + max_h * 8 - 1) // (max_h * 8)
-        bh = (height * v + max_v * 8 - 1) // (max_v * 8)
-        grids[cid] = [[0.0] * bw for _ in range(bh)]
-    comp_by_id = {c[0]: c for c in comps}
-    scan = {cid: (huff_dc[td], huff_ac[ta], comp_by_id[cid])
-            for cid, td, ta in scan_comps}
-    br = BitReader(data, start)
-    pred = {cid: 0 for cid in scan}
-    mcu_count = 0
-    for my in range(mcus_y):
-        for mx in range(mcus_x):
-            if restart_interval and mcu_count and mcu_count % restart_interval == 0:
-                br.align()
-                pred = {cid: 0 for cid in scan}
-                # skip the RST marker bytes in the stream (only if actually present)
-                while (br.pos + 1 < len(data) and data[br.pos] == 0xFF
-                       and 0xD0 <= data[br.pos + 1] <= 0xD7):
-                    br.pos += 2
-                    break
-            for cid, (dct, act, (ccid, h, v, tq)) in scan.items():
-                q0 = qtab[tq][0]
-                for by in range(v):
-                    for bx in range(h):
-                        cat = dct.decode(br)
-                        diff = _extend(br.bits(cat), cat)
-                        pred[cid] += diff
-                        avg = pred[cid] * q0 / 8.0 + 128.0
-                        gx = mx * h + bx
-                        gy = my * v + by
-                        g = grids[cid]
-                        if gy < len(g) and gx < len(g[0]):
-                            g[gy][gx] = avg
-                        # skip AC coefficients: count COEFFICIENTS, not symbols.
-                        # A block that exactly fills all 63 AC coefficients has
-                        # no EOB marker; counting iterations over-consumes into
-                        # the next block. Track coverage instead.
-                        covered = 0
-                        while covered < 63:
-                            sym = act.decode(br)
-                            run = sym >> 4
-                            size = sym & 0xF
-                            if size == 0:
-                                if run == 15:
-                                    covered += 16
-                                    continue
-                                break  # EOB
-                            covered += run + 1
-                            br.bits(size)
-            mcu_count += 1
-    # luma grid resolution
-    y_id = comps[0][0]
-    y_grid = grids[y_id]
-    bw = len(y_grid[0])
-    bh = len(y_grid)
-    if len(comps) == 1:
-        return width, height, bw, bh, y_grid, None, None
-
-    def upsample(grid, ch, cv):
-        # nearest-neighbour upsample chroma grid to luma-block grid
-        out = []
-        for gy in range(bh):
-            sy = min(gy * cv // max_v, len(grid) - 1)
-            row = []
-            for gx in range(bw):
-                sx = min(gx * ch // max_h, len(grid[0]) - 1)
-                row.append(grid[sy][sx])
-            out.append(row)
-        return out
-
-    cb = cr = None
-    for cid, h, v, tq in comps[1:]:
-        up = upsample(grids[cid], h, v)
-        if cb is None:
-            cb = up
-        else:
-            cr = up
-    return width, height, bw, bh, y_grid, cb, cr
-
-
-def ycbcr_to_rgb_grid(y, cb, cr):
-    """Convert block grids to RGB rows (values 0..255, clamped)."""
-    rows = []
-    for yi, row in enumerate(y):
-        out = []
-        for xi, v in enumerate(row):
-            cbb = (cb[yi][xi] - 128.0) if cb else 0.0
-            crr = (cr[yi][xi] - 128.0) if cr else 0.0
-            r = v + 1.402 * crr
-            g = v - 0.34414 * cbb - 0.71414 * crr
-            b = v + 1.772 * cbb
-            out.append((max(0.0, min(255.0, r)),
-                        max(0.0, min(255.0, g)),
-                        max(0.0, min(255.0, b))))
-        rows.append(out)
-    return rows
-
-# --- agent: model-free photo geolocator -------------------------------------
-# Stdlib only. No model calls, no network except the trial env, no clock, no
-# unseeded randomness: given the same photos it always posts the same answers.
-import json
-import os
-import sys
-import urllib.request
-import urllib.error
-
-# Rule centroids, fitted on the kit's 3 public practice trials (75 photos)
-# by leave-one-trial-out validation: these three rules beat a fixed guess
-# out-of-sample; every other candidate rule made it worse and was dropped.
-DEFAULT = (55.0, 25.0)      # best single fixed guess for OpenStreetView-5M
-SNOW = (53.0, 45.0)         # snow + bright sky -> Russian winter
-TEMPGREEN = (43.0, -88.0)   # temperate green -> N. America interior
-URBAN = (50.0, 77.0)        # grey asphalt/urban -> Central Asia
-
-
-def photo_features(rgb, bw, bh):
-    """Colour/texture fractions from the per-8x8-block RGB grid."""
-    n = bw * bh
-    mr = sum(p[0] for row in rgb for p in row) / n
-    mg = sum(p[1] for row in rgb for p in row) / n
-    mb = sum(p[2] for row in rgb for p in row) / n
-    sky = veg = snow = sand = gray = water = 0
-    top_rows = max(1, int(bh * 0.3))
-    sky_top = 0
-    for yi, row in enumerate(rgb):
-        for (r, g, b) in row:
-            if b > r + 12 and b > g + 6 and b > 90:
-                sky += 1
-                if yi < top_rows:
-                    sky_top += 1
-            if g > r + 10 and g > b + 10 and g > 60:
-                veg += 1
-            if r > 200 and g > 200 and b > 200 and (max(r, g, b) - min(r, g, b)) < 25:
-                snow += 1
-            if r > 140 and r > g + 15 and g > b + 5 and r < 230:
-                sand += 1
-            if (max(r, g, b) - min(r, g, b)) < 22 and 55 < r < 175:
-                gray += 1
-            if b > r + 25 and 70 < b < 200:
-                water += 1
-    bright_top = 0.0
-    cnt = 0
-    for yi in range(top_rows):
-        for (r, g, b) in rgb[yi]:
-            bright_top += (r + g + b) / 3.0
-            cnt += 1
-    bright_top = bright_top / cnt if cnt else 0.0
-    return {
-        "mean": (mr, mg, mb),
-        "sky_top": sky_top / max(1, bw * top_rows),
-        "veg": veg / n,
-        "snow": snow / n,
-        "sand": sand / n,
-        "gray": gray / n,
-        "water": water / n,
-        "bright_top": bright_top,
+    if data[:2] != b"\xff\xd8":
+        raise ValueError("not a JPEG file")
+    info = {
+        "quant": {},
+        "dc_tables": {},
+        "ac_tables": {},
+        "restart_interval": 0,
     }
+    pos = 2
+    while pos + 1 < len(data):
+        if data[pos] != 0xFF:
+            raise ValueError("expected JPEG marker at offset %d" % pos)
+        marker = data[pos + 1]
+        if marker == 0xD8:  # SOI, no payload
+            pos += 2
+            continue
+        if marker == 0xD9:  # EOI
+            break
+        if marker == 0x01 or 0xD0 <= marker <= 0xD7:
+            pos += 2
+            continue
+        length = (data[pos + 2] << 8) | data[pos + 3]
+        body = data[pos + 4:pos + 2 + length]
+        if marker == 0xDB:  # DQT: quantisation tables
+            i = 0
+            while i < len(body):
+                precision = body[i] >> 4
+                table_id = body[i] & 0x0F
+                i += 1
+                values = []
+                for _ in range(64):
+                    if precision:
+                        values.append((body[i] << 8) | body[i + 1])
+                        i += 2
+                    else:
+                        values.append(body[i])
+                        i += 1
+                # Only the DC entry (zigzag position 0) is ever used here.
+                info["quant"][table_id] = values[0]
+        elif marker == 0xC4:  # DHT: Huffman tables
+            i = 0
+            while i < len(body):
+                table_class = body[i] >> 4
+                table_id = body[i] & 0x0F
+                counts = list(body[i + 1:i + 17])
+                total = sum(counts)
+                symbols = list(body[i + 17:i + 17 + total])
+                table = build_huffman(counts, symbols)
+                if table_class == 0:
+                    info["dc_tables"][table_id] = table
+                else:
+                    info["ac_tables"][table_id] = table
+                i += 17 + total
+        elif marker == 0xC0:  # SOF0: baseline frame
+            height = (body[1] << 8) | body[2]
+            width = (body[3] << 8) | body[4]
+            ncomp = body[5]
+            components = []
+            for k in range(ncomp):
+                off = 6 + 3 * k
+                comp_id = body[off]
+                sampling = body[off + 1]
+                quant_id = body[off + 2]
+                components.append({
+                    "id": comp_id,
+                    "h": sampling >> 4,
+                    "v": sampling & 0x0F,
+                    "tq": quant_id,
+                })
+            info["width"] = width
+            info["height"] = height
+            info["components"] = components
+        elif marker == 0xC2:  # SOF2: progressive, not supported
+            raise ValueError("progressive JPEG not supported")
+        elif marker == 0xDD:  # DRI: restart interval
+            info["restart_interval"] = (body[0] << 8) | body[1]
+        elif marker == 0xDA:  # SOS: start of scan, entropy follows
+            ncomp = body[0]
+            scan = {}
+            for k in range(ncomp):
+                off = 1 + 2 * k
+                comp_id = body[off]
+                tables = body[off + 1]
+                scan[comp_id] = {
+                    "td": tables >> 4,
+                    "ta": tables & 0x0F,
+                }
+            info["scan"] = scan
+            return info, pos + 2 + length
+        pos += 2 + length
+    raise ValueError("no scan found in JPEG")
 
 
-def classify(f):
-    """(lat, lon) guess for one photo's features."""
-    if f["snow"] > 0.32 and f["bright_top"] > 200:
-        return SNOW
-    if 0.20 <= f["veg"] <= 0.30:
-        return TEMPGREEN
-    if f["gray"] > 0.50:
-        return URBAN
-    return DEFAULT
+def clean_entropy(raw):
+    """Strip byte stuffing from entropy data and note restart markers.
+
+    Returns (clean_bytes, restart_positions): restart_positions holds the
+    clean-stream offset of the first data byte after each restart marker.
+    """
+    out = bytearray()
+    restarts = []
+    i = 0
+    n = len(raw)
+    while i < n:
+        byte = raw[i]
+        if byte == 0xFF:
+            if i + 1 >= n:
+                break
+            nxt = raw[i + 1]
+            if nxt == 0x00:
+                out.append(0xFF)
+                i += 2
+            elif 0xD0 <= nxt <= 0xD7:
+                restarts.append(len(out))
+                i += 2
+            elif nxt == 0xD9:
+                break
+            else:
+                break
+        else:
+            out.append(byte)
+            i += 1
+    return bytes(out), restarts
 
 
-def http_json(url, data=None, timeout=60):
-    req = urllib.request.Request(url)
-    if data is not None:
-        body = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=body,
-                                     headers={"Content-Type": "application/json"},
-                                     method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def decode_block(reader, info, comp_index, predictors):
+    """Decode one 8x8 block, returning its dequantised DC coefficient.
+
+    Only the DC value is kept. The AC coefficients are skipped, but the
+    skip has to count coefficients, not symbols: a run-length code of 15
+    zeros plus a coefficient covers 16 coefficients, and an end-of-block
+    code ends the block. A block that uses all 63 AC coefficients with no
+    end-of-block must stop exactly at 63 or it eats the next block.
+    """
+    comp = info["components"][comp_index]
+    dc_table, dc_lut = info["dc_tables"][info["scan"][comp["id"]]["td"]]
+    ac_table, ac_lut = info["ac_tables"][info["scan"][comp["id"]]["ta"]]
+    size = huffman_decode(reader, dc_table, dc_lut)
+    diff = extend_value(reader.bits(size), size)
+    predictors[comp_index] += diff
+    dc = predictors[comp_index] * info["quant"][comp["tq"]]
+    covered = 0
+    while covered < 63:
+        symbol = huffman_decode(reader, ac_table, ac_lut)
+        if symbol == 0x00:  # end of block
+            break
+        run = symbol >> 4
+        size = symbol & 0x0F
+        if run == 15 and size == 0:  # ZRL: 15 zeros plus a coefficient
+            covered += 16
+        else:
+            covered += run + (1 if size else 0)
+            if size:
+                reader.bits(size)
+    return dc
 
 
-def http_bytes(url, timeout=60):
-    with urllib.request.urlopen(url, timeout=timeout) as resp:
-        return resp.read()
+def decode_dc_grids(data):
+    """Decode a JPEG into one DC grid per component.
+
+    Each grid entry is the dequantised DC coefficient of one 8x8 block.
+    The block's average pixel value is dc / 16 + 128.
+    """
+    info, entropy_start = parse_segments(data)
+    clean, restarts = clean_entropy(data[entropy_start:])
+    reader = BitReader(clean, restarts)
+    comps = info["components"]
+    h_max = max(c["h"] for c in comps)
+    v_max = max(c["v"] for c in comps)
+    mcu_x = (info["width"] + 8 * h_max - 1) // (8 * h_max)
+    mcu_y = (info["height"] + 8 * v_max - 1) // (8 * v_max)
+    grids = []
+    for comp in comps:
+        grid_w = (info["width"] * comp["h"] + 8 * h_max - 1) // (8 * h_max)
+        grid_h = (info["height"] * comp["v"] + 8 * v_max - 1) // (8 * v_max)
+        grids.append([[0] * grid_w for _ in range(grid_h)])
+    predictors = [0] * len(comps)
+    interval = info["restart_interval"]
+    done = 0
+    for my in range(mcu_y):
+        for mx in range(mcu_x):
+            for ci, comp in enumerate(comps):
+                for by in range(comp["v"]):
+                    for bx in range(comp["h"]):
+                        gy = my * comp["v"] + by
+                        gx = mx * comp["h"] + bx
+                        value = decode_block(reader, info, ci, predictors)
+                        if gy < len(grids[ci]) and gx < len(grids[ci][0]):
+                            grids[ci][gy][gx] = value
+            done += 1
+            if interval and done % interval == 0:
+                reader.align_restart()
+                predictors = [0] * len(comps)
+    return info, grids
+
+
+def block_average(dc):
+    """Average pixel value of a block from its dequantised DC coefficient.
+
+    The JPEG DCT has a 1/sqrt(2) factor on the zero frequency, so the DC
+    coefficient is 8 times the block mean of the level-shifted pixels:
+    mean = dc / 8 + 128.
+    """
+    return dc / 8.0 + 128.0
+
+
+def ycbcr_to_rgb(y, cb, cr):
+    """Convert one block-average YCbCr triple to RGB, clamped to 0..255."""
+    r = y + 1.402 * (cr - 128.0)
+    g = y - 0.34414 * (cb - 128.0) - 0.71414 * (cr - 128.0)
+    b = y + 1.772 * (cb - 128.0)
+    if r < 0.0:
+        r = 0.0
+    elif r > 255.0:
+        r = 255.0
+    if g < 0.0:
+        g = 0.0
+    elif g > 255.0:
+        g = 255.0
+    if b < 0.0:
+        b = 0.0
+    elif b > 255.0:
+        b = 255.0
+    return r, g, b
+
+
+def photo_features(info, grids):
+    """Measure snow, sky brightness, vegetation and grey cover.
+
+    Returns (snow, bright_top, veg, gray):
+      snow       -- share of blocks that are near-white on all channels
+      bright_top -- mean brightness of the top quarter of block rows
+      veg        -- share of blocks where green clearly dominates
+      gray       -- share of blocks that are low-saturation mid-grey
+    """
+    y_grid = grids[0]
+    rows = len(y_grid)
+    cols = len(y_grid[0])
+    comps = info["components"]
+    has_colour = len(grids) >= 3
+    snow = 0
+    veg = 0
+    gray = 0
+    top_total = 0.0
+    top_count = 0
+    top_rows = max(1, rows // 4)
+    total = 0
+    for by in range(rows):
+        for bx in range(cols):
+            y = block_average(y_grid[by][bx])
+            if has_colour:
+                # Chroma blocks cover several luma blocks when subsampled;
+                # map each luma block to the chroma block that contains it.
+                cb_comp = comps[1]
+                cr_comp = comps[2]
+                cb_x = bx * cb_comp["h"] // comps[0]["h"]
+                cb_y = by * cb_comp["v"] // comps[0]["v"]
+                cr_x = bx * cr_comp["h"] // comps[0]["h"]
+                cr_y = by * cr_comp["v"] // comps[0]["v"]
+                cb = block_average(grids[1][cb_y][cb_x])
+                cr = block_average(grids[2][cr_y][cr_x])
+                r, g, b = ycbcr_to_rgb(y, cb, cr)
+            else:
+                r = g = b = y
+            bright = (r + g + b) / 3.0
+            if r > 200.0 and g > 200.0 and b > 200.0:
+                snow += 1
+            if g > r + 12.0 and g > b + 12.0 and g > 60.0:
+                veg += 1
+            spread = max(r, g, b) - min(r, g, b)
+            if spread < 20.0 and 60.0 <= bright <= 180.0:
+                gray += 1
+            if by < top_rows:
+                top_total += bright
+                top_count += 1
+            total += 1
+    return (
+        snow / total,
+        top_total / top_count if top_count else 0.0,
+        veg / total,
+        gray / total,
+    )
+
+
+def guess_location(snow, bright_top, veg, gray):
+    """Apply the validated rule set, in order, and return (lat, lon)."""
+    if snow > 0.32 and bright_top > 200.0:
+        return GUESS_RUSSIAN_WINTER
+    if 0.20 <= veg <= 0.30:
+        return GUESS_NORTH_AMERICA
+    if gray > 0.50:
+        return GUESS_CENTRAL_ASIA
+    return GUESS_FALLBACK
+
+
+def guess_photo(jpeg_bytes):
+    """Decode one photo and guess where it was taken.
+
+    Any decode failure falls back to the single best fixed guess so the
+    photo still gets an answer instead of breaking the whole trial.
+    """
+    try:
+        info, grids = decode_dc_grids(jpeg_bytes)
+        snow, bright_top, veg, gray = photo_features(info, grids)
+        return guess_location(snow, bright_top, veg, gray)
+    except Exception:
+        return GUESS_FALLBACK
+
+
+def fetch_json(url):
+    with urllib.request.urlopen(url) as response:
+        return json.load(response)
+
+
+def fetch_bytes(url):
+    with urllib.request.urlopen(url) as response:
+        return response.read()
 
 
 def main():
-    env = os.environ.get("MAKEFUN_ENV_URL", "").rstrip("/")
-    if not env:
-        print("MAKEFUN_ENV_URL is not set", file=sys.stderr)
-        return 1
-    prompt_file = os.environ.get("MAKEFUN_PROMPT_FILE", "")
-    if prompt_file:
-        try:
-            with open(prompt_file, "r", encoding="utf-8") as fh:
-                fh.read()
-        except OSError:
-            pass
-    photos = http_json(env + "/photos")["photos"]
+    base = os.environ.get("MAKEFUN_ENV_URL", "http://127.0.0.1:8765")
+    base = base.rstrip("/")
+    listing = fetch_json(base + "/photos")
     answers = []
-    for photo in photos:
-        pid = photo["id"]
-        guess = DEFAULT
-        try:
-            url = photo.get("url") or ("/photos/%s.jpg" % pid)
-            if url.startswith("http"):
-                raw = http_bytes(url)
-            else:
-                raw = http_bytes(env + url)
-            w, h, bw, bh, y, cb, cr = decode_dc_grid(raw)
-            rgb = ycbcr_to_rgb_grid(y, cb, cr)
-            guess = classify(photo_features(rgb, bw, bh))
-        except Exception as exc:  # never leave a photo unanswered
-            print("photo %s: %s; using default guess" % (pid, exc),
-                  file=sys.stderr)
-            guess = DEFAULT
-        answers.append({"id": pid,
-                        "lat": round(guess[0], 6),
-                        "lon": round(guess[1], 6)})
-    # Post in one batch; on a whole-batch refusal, retry per photo so a
-    # single bad answer cannot block the rest.
-    try:
-        res = http_json(env + "/answers", {"answers": answers})
-        print("posted %d answers, accepted %s" % (len(answers), res.get("accepted")),
-              file=sys.stderr)
-    except urllib.error.HTTPError:
-        posted = 0
-        for ans in answers:
-            try:
-                http_json(env + "/answers", {"answers": [ans]})
-                posted += 1
-            except Exception as exc:
-                print("photo %s: post failed: %s" % (ans["id"], exc),
-                      file=sys.stderr)
-        print("posted %d/%d answers one by one" % (posted, len(answers)),
-              file=sys.stderr)
-    return 0
+    for photo in listing["photos"]:
+        url = photo["url"]
+        if url.startswith("/"):
+            url = base + url
+        elif not url.startswith("http"):
+            url = base + "/" + url
+        lat, lon = guess_photo(fetch_bytes(url))
+        answers.append({"id": photo["id"], "lat": lat, "lon": lon})
+    payload = json.dumps({"answers": answers}).encode("utf-8")
+    request = urllib.request.Request(
+        base + "/answers",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request) as response:
+        print(response.read().decode("utf-8"))
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
